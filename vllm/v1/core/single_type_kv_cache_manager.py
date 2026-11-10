@@ -112,6 +112,9 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool = block_pool
         self.enable_caching = enable_caching
         self.max_admission_blocks_per_request = max_admission_blocks_per_request
+        # {req_id: tighter admission cap} for requests whose prefill chunks the
+        # scheduler capped (see `SchedulerConfig.prefill_chunk_backoff`).
+        self.admission_cap_overrides: dict[str, int] = {}
         # Record newly allocated block ids only when worker-side zeroing will
         # consume them and this manager holds a spec type that gets zeroed.
         self._record_new_block_ids = (
@@ -233,10 +236,11 @@ class SingleTypeKVCacheManager(ABC):
             # `sum(reservations) <= pool` <=> `sum(peak_real_held) <= pool`.
             # Drift between the two would re-introduce the deadlock from
             # issue #39734 or, worse, mid-prefill OOM.
+            admission_cap = self.admission_cap_overrides.get(
+                request_id, self.max_admission_blocks_per_request
+            )
             if num_req_blocks == 0:
-                num_required_blocks = min(
-                    num_required_blocks, self.max_admission_blocks_per_request
-                )
+                num_required_blocks = min(num_required_blocks, admission_cap)
             else:
                 # `req_to_blocks` is positional: skipped blocks (and the
                 # skipped prefix of an external load) are null placeholders,
@@ -248,9 +252,7 @@ class SingleTypeKVCacheManager(ABC):
                     if block.is_null:
                         break
                     num_recyclable_blocks += block.ref_cnt == 1
-                admission_budget = max(
-                    self.max_admission_blocks_per_request - num_recyclable_blocks, 0
-                )
+                admission_budget = max(admission_cap - num_recyclable_blocks, 0)
 
         if request_id in self.num_cached_block:
             # Fast-path: a running request won't have any new prefix-cache hits.
@@ -617,6 +619,7 @@ class SingleTypeKVCacheManager(ABC):
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
+        self.admission_cap_overrides.pop(request_id, None)
         return trim_null_head(req_blocks)
 
     def free(self, request_id: str) -> None:
